@@ -11,6 +11,7 @@ from html import escape
 import math
 import pandas as pd
 import csv
+from urllib.parse import urlparse, parse_qs, urlunparse
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -29,6 +30,28 @@ class FTScraper:
 			result = float_wholesaleprice - round(float_wholesaleprice * 5 / 100, 2)
 
 		return f"{result:.2f}"
+
+	def get_fullscale_image_url(self, url):
+		parsed_url = urlparse(url)
+		query_params = parse_qs(parsed_url.query)
+		query_params.pop('width', None)  # Remove 'width' if it exists
+
+		# Rebuild the query string without 'width'
+		new_query = '&'.join(
+			f"{k}={v[0]}" for k, v in query_params.items()
+		)
+
+		# Reconstruct the URL without 'width'
+		result = urlunparse((
+			parsed_url.scheme,    # https
+			parsed_url.netloc,    # www.yescomusa.com
+			parsed_url.path,      # /cdn/shop/files/07top007-10t-navy_402.jpg
+			parsed_url.params,    # (usually empty)
+			new_query,           # v=1741168066 (no width)
+			parsed_url.fragment   # (usually empty)
+		))
+
+		return result
 
 	def clean_html(self, html_content):
 		# 1. Remove non-standard attributes that Shopify may not recognize
@@ -263,6 +286,47 @@ class FTScraper:
 
 		return product_data
 
+	def extract_product_data_detail(self, script_content):
+		pattern = r'initData:\s*({.*?}),\s*function'
+		matches = re.findall(pattern, script_content, re.DOTALL)
+
+		if not matches[0]:
+			return "No product data found in the script."
+
+		product_data = []
+
+		try:
+			raw_json = matches[0][0:-2]
+			data = self.clean_json_string(raw_json)
+			# print('=========================================')
+			# print(data)
+
+			# Check if this is the view_item event with product data
+			# if data.get("event_name") == "view_item" and "items" in data.get("event_parameters", {}):
+			variants = data["productVariants"]
+
+			for item in variants:
+				product_data.append({
+					"Item ID": item.get("sku", ""),
+					"Product Name": item['product'].get("title", ""),
+					"Category": item['product'].get("type", ""),
+					"Variant": item.get("title", ""),
+					"Brand": item["product"].get("vendor", ""),
+					"Price": item["price"].get("amount", 0.00),
+					"Currency": item["price"].get("currencyCode", "USD"),
+					"Image Src": item["image"].get("src", "")
+				})
+
+		except json.JSONDecodeError as e:
+			print(f"Error parsing JSON: {e}")
+		except Exception as e:
+			print(f"Error: {e}")
+
+		if not product_data:
+			return "No product items found in the dataLayer."
+
+		return product_data
+
 	def get_data(self):
 		logger.info('Getting data from database...')
 		conn = duckdb.connect("yescomusa.db")
@@ -281,48 +345,59 @@ class FTScraper:
 			script_tags = tree.css('script')
 			script_content = None
 
+			# for script in script_tags:
+			# 	if '"event_name": "view_item",' in script.text():
+			# 		script_content = script.text()
+			# 		break
+			# if script_content:
+			# 	product_data = self.extract_product_data_variant(script_content)
+			# print('============================================================')
+			# print(product_data)
+
 			for script in script_tags:
-				if '"event_name": "view_item",' in script.text():
+				if 'initData' in script.text():
 					script_content = script.text()
 					break
 			if script_content:
-				product_data = self.extract_product_data_variant(script_content)
+				product_data = self.extract_product_data_detail(script_content)
+			print('================================================================')
 			print(product_data)
 
 			current_product['Handle'] = data[0].split('/')[-1]
 			current_product['Title'] = product_data[0]['Product Name']
 			current_product['Body (HTML)'] = self.clean_html(tree.css_first('div.product-tabs-container > div >div').html)
 			current_product['Vendor'] = product_data[0]['Brand']
-		# 	breadcrumbs = tree.css('li.breadcrumb__item')
-		# 	breadcrumb_list = [breadcrumb.text(strip=True) for breadcrumb in breadcrumbs]
-			# current_product['Product Category'] = ' > '.join(breadcrumb_list[1:-1])
-		# 	current_product['Type'] = product_data['type']
-		# 	current_product['Tags'] = ', '.join(product_data['tags'])
-		# 	product_elem = tree.css_first('div.product-block-list__item--info')
-		# 	option_label = product_elem.css_first('span.product-form__option-name')
-		# 	if not option_label:
-		# 		option_label = product_elem.css_first('label.product-form__option-name')
-		# 	if option_label:
-		# 	# for index, option_label in enumerate(option_labels, 1):
-		# 		current_product['Option1 Name'] = option_label.text(strip=True).split(':')[0]
+			breadcrumbs = tree.css('li[itemprop="itemListElement"]')
+			breadcrumb_list = [breadcrumb.text(strip=True) for breadcrumb in breadcrumbs]
+			current_product['Product Category'] = ' > '.join(breadcrumb_list[1:-1])
+			current_product['Type'] = product_data[0]['Category']
+			current_product['Tags'] = ', '.join(breadcrumb_list[1:-1])
+			product_elem = tree.css_first('div#shopify-section-pr_summary')
+			option_label = product_elem.css_first('h4.swatch__title')
+			if not option_label:
+				option_label = product_elem.css_first('label.product-form__option-name')
+			if option_label:
+				current_product['Option1 Name'] = option_label.text(strip=True).split(':')[0]
+			image_elements = tree.css('div.col-lg-12.col-3.n-item.splide__slide.pr_page_image.lz_loading_bg')
+			image_srcs = [elem.css_first('img').attrs['src'] for elem in image_elements]
 
-		# 	option1_values = list()
+			option1_values = list()
 		# 	option2_values = list()
 		# 	option3_values = list()
-		# 	variant_skus = list()
-		# 	variant_weight = list()
+			variant_skus = list()
+			# variant_weight = list()
 		# 	variant_qty = list()
-		# 	variant_cost = list()
-		# 	variant_image = list()
+			variant_cost = list()
+			variant_image = list()
 		# 	variant_requires_shipping = list()
 		# 	variant_taxable = list()
 
-		# 	for variant in product_data['variants']:
-		# 		if current_product['Option1 Name'] != '':
-		# 			if variant['option1'] != 'None':
-		# 				option1_values.append(variant['option1'])
-		# 		else:
-		# 			option1_values = ''
+			for variant in product_data:
+				if current_product['Option1 Name'] != '':
+					if variant['Variant'] != 'None':
+						option1_values.append(variant['Variant'])
+				else:
+					option1_values = ''
 
 		# 		if current_product['Option2 Name'] != '':
 		# 			if variant['option2'] != 'None':
@@ -336,44 +411,44 @@ class FTScraper:
 		# 		else:
 		# 			option3_values = ''
 
-		# 		variant_skus.append(variant['sku'])
-		# 		try:
-		# 			variant_weight.append(round(variant['weight'] / 100, 2))
-		# 		except KeyError:
-		# 			pass
+				variant_skus.append(variant['Item ID'])
+				# try:
+				# 	variant_weight.append(round(variant['weight'] / 100, 2))
+				# except KeyError:
+				# 	pass
 		# 		try:
 		# 			variant_qty.append(10 if variant['available'] else 0)
 		# 		except KeyError:
 		# 			variant_qty.append(10 if product_data['available'] else 0)
-		# 		try:
-		# 			variant_cost.append(round(variant['price'] / 100, 2))
-		# 		except KeyError:
-		# 			variant_cost.append(round(product_data['price'] / 100, 2))
-		# 		try:
-		# 			variant_image.append(f"https:{variant['featured_image']['src']}")
-		# 		except Exception:
-		# 			variant_image.append('')
+				# try:
+				variant_cost.append(variant['Price'])
+				# except KeyError:
+				# 	variant_cost.append(round(product_data['Price'] / 100, 2))
+				try:
+					variant_image.append(f"https:{variant['Image Src']}")
+				except Exception:
+					variant_image.append('')
 		# 		variant_requires_shipping.append(variant['requires_shipping'])
 		# 		variant_taxable.append(variant['taxable'])
 
-		# 	current_product['Option1 Value'] = option1_values
+			current_product['Option1 Value'] = option1_values
 		# 	current_product['Option2 Value'] = option2_values
 		# 	current_product['Option3 Value'] = option3_values
-		# 	current_product['Variant SKU'] = variant_skus
+			current_product['Variant SKU'] = variant_skus
 		# 	current_product['Variant Grams'] = variant_weight
 		# 	current_product['Variant Inventory Qty'] = variant_qty
-		# 	current_product['Google Shopping / Custom Label 0'] = 'YCU'
-		# 	current_product['Variant Image'] = variant_image
-		# 	current_product['Cost per item'] = variant_cost
-		# 	current_product['Variant Price'] = [self.get_price(x) for x in variant_cost]
-		# 	current_product['Variant Compare At Price'] = ''
-		# 	current_product['Variant Requires Shipping'] = variant_requires_shipping
+			current_product['Google Shopping / Custom Label 0'] = 'YCU'
+			current_product['Variant Image'] = variant_image
+			current_product['Cost per item'] = variant_cost
+			current_product['Variant Price'] = [self.get_price(x) for x in variant_cost]
+			current_product['Variant Compare At Price'] = ''
+			# current_product['Variant Requires Shipping'] = variant_requires_shipping
 		# 	current_product['Variant Taxable'] = variant_taxable
-		# 	try:
-		# 		current_product['Image Src'] = [f'https:{url}'for url in product_data['images']]
-		# 		current_product['Image Alt Text'] = [url.split('/')[-1].split('?')[0] for url in product_data['images']]
-		# 	except KeyError:
-		# 		pass
+			try:
+				current_product['Image Src'] = [self.get_fullscale_image_url(f'https:{url}') for url in image_srcs]
+				current_product['Image Alt Text'] = [url.split('/')[-1].split('?')[0] for url in image_srcs]
+			except KeyError:
+				pass
 
 			# product_datas.append(current_product)
 
@@ -382,6 +457,7 @@ class FTScraper:
 		# logger.info('Data Extracted!')
 
 		# return df
+		print('==========================================================')
 		print(current_product)
 
 	def transform_product_datas(self, df):
