@@ -34,21 +34,19 @@ class FTScraper:
 	def get_fullscale_image_url(self, url):
 		parsed_url = urlparse(url)
 		query_params = parse_qs(parsed_url.query)
-		query_params.pop('width', None)  # Remove 'width' if it exists
+		query_params.pop('width', None)
 
-		# Rebuild the query string without 'width'
 		new_query = '&'.join(
 			f"{k}={v[0]}" for k, v in query_params.items()
 		)
 
-		# Reconstruct the URL without 'width'
 		result = urlunparse((
-			parsed_url.scheme,    # https
-			parsed_url.netloc,    # www.yescomusa.com
-			parsed_url.path,      # /cdn/shop/files/07top007-10t-navy_402.jpg
-			parsed_url.params,    # (usually empty)
-			new_query,           # v=1741168066 (no width)
-			parsed_url.fragment   # (usually empty)
+			parsed_url.scheme,
+			parsed_url.netloc,
+			parsed_url.path,
+			parsed_url.params,
+			new_query,
+			parsed_url.fragment
 		))
 
 		return result
@@ -154,8 +152,8 @@ class FTScraper:
 		headers = {
 			'user-agent': self.user_agent
 		}
-		limit = asyncio.Semaphore(4)
-		async with AsyncClient(headers=headers, timeout=120) as aclient:
+		limit = asyncio.Semaphore(10)
+		async with AsyncClient(headers=headers, timeout=120, proxy='http://p.webshare.io:9999') as aclient:
 			for url in urls:
 				task = asyncio.create_task(self.fetch(aclient, url=url, limit=limit))
 				tasks.append(task)
@@ -193,58 +191,63 @@ class FTScraper:
 		# Extract the JSON string
 		json_str = match.group(1)
 
-		try:
-			cleaned_json = re.sub(r'([{,])\s*(\w+):', r'\1"\2":', json_str)
+		# try:
+		cleaned_json_1 = re.sub(r'([{,])\s*(\w+):', r'\1"\2":', json_str)
+		product_data = self.clean_json_string(cleaned_json_1)
 
-			product_data = json.loads(cleaned_json)
+		extracted_data = {
+			"Product Name": product_data.get("name", ""),
+			"Description": re.sub(r'\s+', ' ', product_data.get("description", "")),
+			"SKU": product_data.get("sku", ""),
+			"MPN": product_data.get("mpn", ""),
+			"Color": product_data.get("color", ""),
+			"Product ID": product_data.get("productID", ""),
+			"Brand": product_data.get("brand", {}).get("name", ""),
+			"Price": product_data.get("offers", {}).get("price", ""),
+			"Currency": product_data.get("offers", {}).get("priceCurrency", ""),
+			"Availability": "In Stock" if "InStock" in product_data.get("offers", {}).get("availability", "") else "Out of Stock",
+			"URL": product_data.get("url", ""),
+		}
 
-			extracted_data = {
-				"Product Name": product_data.get("name", ""),
-				"Description": re.sub(r'\s+', ' ', product_data.get("description", "")),
-				"SKU": product_data.get("sku", ""),
-				"MPN": product_data.get("mpn", ""),
-				"Color": product_data.get("color", ""),
-				"Product ID": product_data.get("productID", ""),
-				"Brand": product_data.get("brand", {}).get("name", ""),
-				"Price": product_data.get("offers", {}).get("price", ""),
-				"Currency": product_data.get("offers", {}).get("priceCurrency", ""),
-				"Availability": "In Stock" if "InStock" in product_data.get("offers", {}).get("availability", "") else "Out of Stock",
-				"URL": product_data.get("url", ""),
-			}
+		# Extract detailed specifications if available
+		specifications = {}
+		description = product_data.get("description", "")
 
-			# Extract detailed specifications if available
-			specifications = {}
-			description = product_data.get("description", "")
+		# Look for product specs (format: Key: Value)
+		spec_pattern = r'(\w+[ \w]+?):\s*([\w./]+?[^,]*)'
+		specs = re.findall(spec_pattern, description)
+		for key, value in specs:
+			if "Material" in key or "Color" in key or "Dimension" in key or "Weight" in key:
+				specifications[key.strip()] = value.strip()
 
-			# Look for product specs (format: Key: Value)
-			spec_pattern = r'(\w+[ \w]+?):\s*([\w./]+?[^,]*)'
-			specs = re.findall(spec_pattern, description)
-			for key, value in specs:
-				if "Material" in key or "Color" in key or "Dimension" in key or "Weight" in key:
-					specifications[key.strip()] = value.strip()
+		if specifications:
+			extracted_data["Specifications"] = specifications
 
-			if specifications:
-				extracted_data["Specifications"] = specifications
+		return extracted_data
 
-			return extracted_data
-
-		except json.JSONDecodeError as e:
-			return f"Error parsing JSON: {e}"
-		except Exception as e:
-			return f"Error: {e}"
+		# except json.JSONDecodeError as e:
+		# 	print(f"Error parsing JSON: {e}")
+		# 	print(cleaned_json)
+		# except Exception as e:
+		# 	print(f"Error: {e}")
+		# 	print(cleaned_json)
 
 	def clean_json_string(self, json_str):
 
 		def replace_inside_quotes(match):
 			return match.group(0).replace("'", "~!~")
 
-		clean_str = re.sub(r'"(?:\\.|[^"\\])*"', replace_inside_quotes, json_str)
+		clean_str = re.sub(r'"description"\s*:\s*".*?",\s*"sku"', '"sku"', json_str, flags=re.DOTALL)
+		clean_str = re.sub(r'"(?:\\.|[^"\\])*"', replace_inside_quotes, clean_str)
 		clean_str = re.sub(r"'([^']*?)'", r'"\1"', clean_str)
 		clean_str = clean_str.replace('`', '"')
 		clean_str = re.sub(r',(\s*[\]}])', r'\1', clean_str)
 		clean_str = clean_str.replace("~!~", "'")
 
-		parsed_json = json.loads(clean_str)
+		try:
+			parsed_json = json.loads(clean_str)
+		except Exception:
+			print(clean_str)
 
 		return parsed_json
 
@@ -278,6 +281,7 @@ class FTScraper:
 
 		except json.JSONDecodeError as e:
 			print(f"Error parsing JSON: {e}")
+			print(data)
 		except Exception as e:
 			print(f"Error: {e}")
 
@@ -319,6 +323,7 @@ class FTScraper:
 
 		except json.JSONDecodeError as e:
 			print(f"Error parsing JSON: {e}")
+			print(variants)
 		except Exception as e:
 			print(f"Error: {e}")
 
@@ -338,7 +343,9 @@ class FTScraper:
 		with open('shopify_schema.json', 'r') as file:
 			product_schema = json.load(file)
 
-		for data in datas[0:1]:
+		for data in datas:
+			print('===============================================================')
+			print(f"Parsing {data[0]} ...")
 			current_product = product_schema.copy()
 			tree = HTMLParser(data[1])
 
@@ -346,13 +353,15 @@ class FTScraper:
 			script_content = None
 
 			# for script in script_tags:
-			# 	if '"event_name": "view_item",' in script.text():
-			# 		script_content = script.text()
-			# 		break
-			# if script_content:
-			# 	product_data = self.extract_product_data_variant(script_content)
-			# print('============================================================')
-			# print(product_data)
+			# 	print('=========================================================')
+			# 	print(script.text())
+
+			for script in script_tags:
+				if 'var seo_html' in script.text():
+					script_content = script.text()
+					break
+			if script_content:
+				product_data_1 = self.extract_product_data(script_content)
 
 			for script in script_tags:
 				if 'initData' in script.text():
@@ -360,8 +369,6 @@ class FTScraper:
 					break
 			if script_content:
 				product_data = self.extract_product_data_detail(script_content)
-			print('================================================================')
-			print(product_data)
 
 			current_product['Handle'] = data[0].split('/')[-1]
 			current_product['Title'] = product_data[0]['Product Name']
@@ -382,15 +389,15 @@ class FTScraper:
 			image_srcs = [elem.css_first('img').attrs['src'] for elem in image_elements]
 
 			option1_values = list()
-		# 	option2_values = list()
-		# 	option3_values = list()
+			option2_values = list()
+			option3_values = list()
 			variant_skus = list()
-			# variant_weight = list()
-		# 	variant_qty = list()
+			variant_weight = list()
+			variant_qty = list()
 			variant_cost = list()
 			variant_image = list()
-		# 	variant_requires_shipping = list()
-		# 	variant_taxable = list()
+			variant_requires_shipping = list()
+			variant_taxable = list()
 
 			for variant in product_data:
 				if current_product['Option1 Name'] != '':
@@ -398,67 +405,58 @@ class FTScraper:
 						option1_values.append(variant['Variant'])
 				else:
 					option1_values = ''
+				if current_product['Option2 Name'] != '':
+					if variant['option2'] != 'None':
+						option2_values.append(variant['option2'])
+				else:
+					option2_values = ''
 
-		# 		if current_product['Option2 Name'] != '':
-		# 			if variant['option2'] != 'None':
-		# 				option2_values.append(variant['option2'])
-		# 		else:
-		# 			option2_values = ''
-
-		# 		if current_product['Option3 Name'] != '':
-		# 			if variant['option3'] != 'None':
-		# 				option3_values.append(variant['option3'])
-		# 		else:
-		# 			option3_values = ''
+				if current_product['Option3 Name'] != '':
+					if variant['option3'] != 'None':
+						option3_values.append(variant['option3'])
+				else:
+					option3_values = ''
 
 				variant_skus.append(variant['Item ID'])
-				# try:
-				# 	variant_weight.append(round(variant['weight'] / 100, 2))
-				# except KeyError:
-				# 	pass
-		# 		try:
-		# 			variant_qty.append(10 if variant['available'] else 0)
-		# 		except KeyError:
-		# 			variant_qty.append(10 if product_data['available'] else 0)
-				# try:
+				variant_weight.append('')
+				try:
+					variant_qty.append(10 if 'In Stock' in product_data_1['Availability'] else 0)
+				except:
+					print(product_data_1)
 				variant_cost.append(variant['Price'])
-				# except KeyError:
-				# 	variant_cost.append(round(product_data['Price'] / 100, 2))
 				try:
 					variant_image.append(f"https:{variant['Image Src']}")
 				except Exception:
 					variant_image.append('')
-		# 		variant_requires_shipping.append(variant['requires_shipping'])
-		# 		variant_taxable.append(variant['taxable'])
+				variant_requires_shipping.append(True)
+				variant_taxable.append(True)
 
 			current_product['Option1 Value'] = option1_values
-		# 	current_product['Option2 Value'] = option2_values
-		# 	current_product['Option3 Value'] = option3_values
+			current_product['Option2 Value'] = option2_values
+			current_product['Option3 Value'] = option3_values
 			current_product['Variant SKU'] = variant_skus
-		# 	current_product['Variant Grams'] = variant_weight
-		# 	current_product['Variant Inventory Qty'] = variant_qty
+			current_product['Variant Grams'] = variant_weight
+			current_product['Variant Inventory Qty'] = variant_qty
 			current_product['Google Shopping / Custom Label 0'] = 'YCU'
 			current_product['Variant Image'] = variant_image
 			current_product['Cost per item'] = variant_cost
 			current_product['Variant Price'] = [self.get_price(x) for x in variant_cost]
 			current_product['Variant Compare At Price'] = ''
-			# current_product['Variant Requires Shipping'] = variant_requires_shipping
-		# 	current_product['Variant Taxable'] = variant_taxable
+			current_product['Variant Requires Shipping'] = variant_requires_shipping
+			current_product['Variant Taxable'] = variant_taxable
 			try:
 				current_product['Image Src'] = [self.get_fullscale_image_url(f'https:{url}') for url in image_srcs]
 				current_product['Image Alt Text'] = [url.split('/')[-1].split('?')[0] for url in image_srcs]
 			except KeyError:
 				pass
 
-			# product_datas.append(current_product)
+			product_datas.append(current_product)
 
-		# df = pd.DataFrame.from_records(product_datas)
+		df = pd.DataFrame.from_records(product_datas)
 
-		# logger.info('Data Extracted!')
+		logger.info('Data Extracted!')
 
-		# return df
-		print('==========================================================')
-		print(current_product)
+		return df
 
 	def transform_product_datas(self, df):
 		# try:
@@ -495,16 +493,12 @@ class FTScraper:
 			rows = csv.reader(file)
 			images_unused_columns = [row[0] for row in rows]
 			df.loc[df.duplicated('Variant SKU', keep='first'), images_unused_columns] = ''
-			df.drop(columns=['Variants', 'Battery Option Value', 'Battery Price'])
-
-		# except Exception as e:
-		# 	print(f"Error: {e}")
 
 		return df
 
 	def fetch_search_result_html(self, url):
-		# total_pages = self.get_product_count(url)
-		total_pages = 1
+		total_pages = self.get_product_count(url)
+		# total_pages = 1
 		urls = [f'{url}?page={page}' for page in range(1, total_pages + 1)]
 		search_results_html = asyncio.run(self.fetch_all(urls))
 		self.insert_to_db(search_results_html, database_name='yescomusa.db', table_name='search_src')
